@@ -1,0 +1,195 @@
+---
+title: "Prepare training data"
+author: "Kelly Hondula"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(dplyr)
+library(fasterize)
+library(leaflet)
+library(readr)
+library(raster)
+library(glue)
+library(stringr)
+```
+
+```{r}
+data_dir <- "/nfs/khondula-data/planetmethane"
+planet_crs <- "+proj=utm +zone=18 +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0"
+
+gb_ws_file <- glue("{data_dir}/polygons/Greensboro_watershed.shp")
+greensboro <- st_read(gb_ws_file) %>%
+  st_transform(planet_crs)
+```
+
+NLCD
+
+woody wetlands 90
+deciduous 41
+evergreen 42
+mixed forest 43
+open water 11
+NOT emergent herbaceous wetlands for training
+
+```{r}
+nlcd_codes <- readr::read_csv("data/nlcd_legend_2011.csv")
+mycovers <- c(41, 42, 43, 90)
+nlcd_greensboro <- FedData::get_nlcd(greensboro,
+                               label = "nlcd",
+                               dataset = "Land_Cover", 
+                               year = 2016,
+                               force.redo = FALSE)
+
+greensboro_prj <- st_transform(greensboro, proj4string(nlcd_greensboro))
+# get just nlcd within greensboro watershed
+nlcd_mask_greens <- raster::mask(nlcd_greensboro, 
+                                 as(greensboro_prj, "Spatial"))
+# plot(nlcd_mask_greens)
+# mask out other land cover types
+# %in% operator acting weird
+nlcd_mask_mycovers <- raster::mask(nlcd_mask_greens, 
+              nlcd_mask_greens == 90 |
+                nlcd_mask_greens == 41 |
+                nlcd_mask_greens == 42 |
+                nlcd_mask_greens == 43,
+                           maskvalue = FALSE)
+plot(nlcd_mask_mycovers)
+
+# covert to polygons
+# slow!
+nlcd_mask_covers_polygons <- raster::rasterToPolygons(nlcd_mask_mycovers, n = 4, dissolve = TRUE)
+nlcd_mask_covers_sf <- st_as_sf(nlcd_mask_covers_polygons) %>%
+  st_transform(planet_crs)
+# plot(nlcd_mask_covers_sf$geometry)
+
+# take out buffered topographic depressions
+# and NWI polygons
+# mvdepressions.shp is 'depressions_UCRW.zip' 
+# downloaded from https://doi.org/10.5066/F70C4T8F
+mvdeps_orig_file <- glue("{data_dir}/polygons/mvdepressions.shp")
+mvdeps <- st_read(mvdeps_orig_file) %>% st_transform(planet_crs)
+# 
+mat1 <- mvdeps %>%
+  sf::st_intersects(greensboro, sparse = FALSE)
+mvdeps_in_gb <- which(apply(mat1, 1, any))
+mvdeps_gb <- mvdeps[mvdeps_in_gb,]
+# 
+mvdeps_gb_buffer10m <- mvdeps_gb %>%
+  st_transform(5070) %>%
+  st_buffer(10) %>%
+  st_transform(planet_crs)
+
+mvdeps_gb_buffer10m %>% saveRDS(glue("{data_dir}/polygons/mvdeps_gb_10m.rds"))
+  
+mvdeps_gb_buffer20m <- mvdeps_gb %>%
+  st_transform(5070) %>%
+  st_buffer(20) %>%
+  st_transform(planet_crs)
+# 
+# plot(mvdeps_gb_buffer20m$geometry)
+mvdeps_gb_buffer20m_filename <- glue("{data_dir}/polygons/mvdeps_v3.shp")
+# mvdeps_gb_buffer20m %>% st_write(mvdeps_gb_buffer20m_filename)
+mvdeps_gb_buffer20m <- st_read(mvdeps_gb_buffer20m_filename)
+# https://r-spatial.github.io/sf/articles/sf3.html
+# operations-returning-a-geometry-1
+
+# slow!
+nlcd_diff_mvdeps <- st_difference(st_union(nlcd_mask_covers_sf),
+              st_union(mvdeps_gb_buffer20m))
+nlcd_diff_mvdeps_sf <- st_as_sf(nlcd_diff_mvdeps)
+# plot(nlcd_diff_mvdeps, col = "green")
+nlcd_diff_mvdeps_sf_cast <- nlcd_diff_mvdeps_sf %>% st_cast(to = "POLYGON")
+
+# now take out NWI (buffered?)
+# national wetlands inventory data downloaded from # https://www.fws.gov/wetlands/Data/Data-Download.html
+nwi_file <- glue("{data_dir}/nwi/HU8_02060005_Watershed/HU8_02060005_Wetlands.shp")
+nwi <- nwi_file %>% st_read() %>% st_transform(planet_crs)
+mat3 <- nwi %>% 
+  sf::st_intersects(greensboro, sparse = FALSE)
+nwi_in_gb <- which(apply(mat3, 1, any))
+nwi_gb <- nwi[nwi_in_gb,]
+nwi_gb_buffer30m <- nwi_gb %>%
+  st_transform(5070) %>%
+  st_buffer(30) %>%
+  st_transform(planet_crs)
+
+# r <- nwi_gb_buffer20m %>% 
+#   as("Spatial") %>%
+#   raster::rasterize(nlcd_mask_greens, field = "WETLAND_TY")
+
+# plot(nwi_gb$geometry)
+# slow!
+nlcd_diff_mvdepsNWI <- st_difference(st_union(nlcd_diff_mvdeps_sf_cast),
+              st_union(nwi_gb_buffer30m))
+nlcd_diff_sf <- st_as_sf(nlcd_diff_mvdepsNWI)
+# plot(nlcd_diff_sf, col = "green")
+nlcd_diff_sf_cast <- nlcd_diff_sf %>% st_cast(to = "POLYGON")
+
+uplandids <- glue("upland{str_pad(1:nrow(nlcd_diff_sf_cast), 4, \"left\", 0)}")
+
+upland_train_sf <- nlcd_diff_sf_cast %>% 
+  mutate(trainid = uplandids,
+         trainclass = "upland") %>%
+  rename(geometry = x)
+
+
+```
+
+
+# WATER CLASS
+```{r}
+nwi_file <- glue("{data_dir}/nwi/HU8_02060005_Watershed/HU8_02060005_Wetlands.shp")
+nwi_water_types <- c("Freshwater Pond", "Lake")
+nwi_FPLAKE <- st_read(nwi_file) %>% 
+  dplyr::filter(WETLAND_TY %in% nwi_water_types) %>%
+  st_transform(planet_crs)
+
+# crop NWI to just those in greensboro watershed
+mat1 <- nwi_FPLAKE %>% 
+  sf::st_intersects(greensboro, sparse = FALSE)
+nwi_in_gb <- which(apply(mat1, 1, any))
+nwi_gb_FPLAKE <- nwi_FPLAKE[nwi_in_gb,]
+# 656 features
+train_water <- nwi_gb_FPLAKE %>% 
+  st_transform(planet_crs) %>% 
+  dplyr::mutate(trainclass = "water")
+
+water_ids_lp <- stringr::str_pad(1:nrow(train_water), 
+                                 width = 3, pad = "0")
+train_water$trainid <- glue("water{water_ids_lp}")
+train_water_df <- sf::st_drop_geometry(train_water)
+train_water <- train_water %>% 
+  st_cast(to = "POLYGON") %>%
+  dplyr::select(trainid, trainclass, geometry)
+```
+
+```{r}
+training_v4 <- rbind(train_water, upland_train_sf)
+training_v4_file <- glue("{data_dir}/polygons/training_v4.shp")
+training_v4 %>% st_write(training_v4_file)
+```
+
+```{r}
+mvdeps_4326 <- st_transform(mvdeps_gb_buffer20m, 4326)
+upland_train_4326 <- nlcd_diff_mvdeps_sf %>% st_transform(4326)
+greensboro4326 <- st_transform(greensboro, 4326)
+train_water4326 <- st_transform(train_water, 4326)
+
+leaflet() %>%
+  addTiles() %>%
+  addPolygons(data = upland_train_4326, 
+              col = "purple",
+              group = "upland") %>%
+  addPolygons(data = mvdeps_4326, 
+              col = "green", group = "mvdeps") %>%
+  addPolygons(data = train_water4326, 
+              group = "water") %>%
+  addPolygons(data = greensboro4326, 
+              col = "black", fillOpacity = 0) %>%
+  addLayersControl(overlayGroups = c("upland", "mvdeps"))
+```

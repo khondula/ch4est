@@ -1,0 +1,45 @@
+---
+title: "03-run-models"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(rsample)
+library(stars)
+library(glue)
+library(velox)
+library(caret)
+library(raster)
+library(dplyr)
+library(sf)
+library(vroom)
+library(fs)
+library(readr)
+library(ranger)
+library(h2o)
+```
+
+
+```{r}
+data_dir <- "/nfs/khondula-data/planetmethane"
+imgs_dir <- glue("{data_dir}/imgs_for_analysis")
+imgs_files <- list.files(imgs_dir, full.names = TRUE)
+imgs_ids <- basename(imgs_files) %>% tools::file_path_sans_ext()
+```
+
+```{r}
+source('R/run_rf_model-v7.R')
+run_rf_model(nomodels_imgs_files[1])
+```
+
+```{r}
+source('R/mvdeps-summarize.R')
+update_mvdeps_predicts_v4(models_id_dir = "h2o-v10-rf")
+```
+

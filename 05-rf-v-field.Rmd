@@ -1,0 +1,142 @@
+---
+title: "05-rf-v-field"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(glue)
+library(dplyr)
+library(readr)
+library(sf)
+library(leaflet)
+```
+
+Compare inundation time series to the field data
+
+```{r}
+wateryear_days <- seq.Date(from = as.Date("2017-10-01"), 
+                             to = as.Date("2018-09-30"), by = 1)
+data_dir <- "/nfs/khondula-data/planetmethane"
+
+wetland_areas <- readr::read_csv("data/jlwl_field_areas.csv", col_types = "icDdld")
+wetland_areas <- wetland_areas %>% dplyr::filter(wetland != "FN")
+
+monthly_wetland_areas <- wetland_areas %>%
+  dplyr::filter(date %in% wateryear_days) %>%
+  dplyr::mutate(yrmonth = glue::glue("{lubridate::year(date)}-{stringr::str_pad(lubridate::month(date), 2, 'left', '0')}")) %>%
+  group_by(yrmonth, wetland) %>%
+  summarise(mean_area_m2 = mean(area_m2, na.rm = TRUE),
+            median_area_m2 = median(area_m2, na.rm = TRUE),
+            sd_area_m2 = sd(area_m2, na.rm = TRUE))
+
+```
+
+
+```{r}
+# for helping identify the ids of my wetlands
+# mvdeps_orig_file <- glue("{data_dir}/polygons/mvdepressions.shp")
+# mvdeps_gb_buffer20m_filename <- glue("{data_dir}/polygons/mvdeps_v3.shp")
+# mvdeps_buff <- st_read(mvdeps_gb_buffer20m_filename)
+# mvdeps <- st_read(mvdeps_orig_file) %>% st_transform(planet_crs)
+# greensboro_file <- glue("{data_dir}/polygons/Greensboro_watershed.shp")
+# greensboro <- sf::st_read(greensboro_file) %>% st_transform(planet_crs)
+# mvdeps_buff_4326 <- mvdeps_buff %>% st_transform(4326) %>% st_crop(ib)
+# 
+# ib <- sf::st_read("/nfs/khondula-data/planetmethane/polygons/ib_polygons.shp") %>% st_transform(4326)
+
+# leaflet(mvdeps_buff_4326) %>%
+#   addProviderTiles(providers$Esri.WorldImagery) %>%
+#   addPolygons(data = ib, popup = ~Wetland, opacity = 1, color = "white",
+#               weight = 1, fillOpacity = 0) %>%
+#   addPolygons(col = "yellow", fillOpacity = 0, opacity = 1, weight = 1,
+#               popup = ~dep_id)
+```
+
+
+
+```{r}
+my_wetlands <- data.frame(wetland = c("BB", "DB", "DK", "ND", "TB", "TA"),
+           dep_id = c("09692", "09634", "10164", "10097", "09697", "09616")) 
+
+my_ids <- my_wetlands$dep_id
+```
+
+get water extent time series
+
+```{r}
+wateryear_days <- seq.Date(from = as.Date("2017-10-01"), 
+                             to = as.Date("2018-09-30"), by = 1)
+
+models_id_dir <- "h2o-v10-rf"
+mov_avg_ts_dir <- glue("{data_dir}/stars/{models_id_dir}/07-mov-avg-ts")
+mov_avg_ts_files <- list.files(mov_avg_ts_dir, full.names = TRUE)
+file_times <- basename(mov_avg_ts_files) %>% 
+    substr(15, 29) %>% lubridate::as_datetime() 
+mov_avg_ts_filename <- mov_avg_ts_files[which.max(order(file_times))]
+mov_avg_ts_filename
+mov_avg_ts <- readRDS(mov_avg_ts_filename)
+
+mov_avg_ts_WY <- mov_avg_ts %>% 
+  dplyr::filter(img_date %in% wateryear_days)
+
+mvdeps_df_dir <- glue("{data_dir}/stars/{models_id_dir}/06-mvdeps-predicts")
+mvdeps_dfs_files <- list.files(mvdeps_df_dir, full.names = TRUE)
+mvdeps_files_ids <- basename(mvdeps_dfs_files) %>% tools::file_path_sans_ext()
+mvdeps_dfs <- mvdeps_dfs_files %>%
+  purrr::map_df(~read_csv(.x, col_types = c("cddddcD")))
+```
+
+filter predictions and moving average time series to just field wetlands
+```{r}
+my_wetlands_preds <- mvdeps_dfs %>%
+  dplyr::filter(ID_sp %in% my_ids) %>%
+  left_join(my_wetlands, by = c("ID_sp" = "dep_id"))
+
+my_wetlands_ma <- mov_avg_ts_WY %>% 
+  dplyr::filter(dep_id %in% my_ids) %>%
+  left_join(my_wetlands, by = c("dep_id" = "dep_id"))
+```
+
+calculate monthly stats for predictions 
+```{r}
+preds_monthly <- my_wetlands_ma %>%
+  dplyr::filter(img_date %in% wateryear_days) %>%
+  dplyr::mutate(yrmonth = glue::glue("{lubridate::year(img_date)}-{stringr::str_pad(lubridate::month(img_date), 2, 'left', '0')}")) %>%
+  group_by(yrmonth, wetland) %>%
+  summarise(mean_area_m2 = mean(water_ma, na.rm = TRUE),
+            median_area_m2 = median(water_ma, na.rm = TRUE),
+            sd_area_m2 = sd(water_ma, na.rm = TRUE))
+
+monthly_wetland_areas <- monthly_wetland_areas %>% mutate(areatype = "field")
+preds_monthly <- preds_monthly %>% 
+  mutate(wetland = as.character(wetland)) %>%
+  mutate(areatype = "dlmodel")
+
+monthly_compare_df <- monthly_wetland_areas %>% rbind(preds_monthly)
+
+areas_long_df <- monthly_compare_df %>% 
+  dplyr::select(-mean_area_m2, -sd_area_m2) %>%
+  tidyr::pivot_wider(names_from = areatype, values_from = median_area_m2) %>%
+  dplyr::rename(field_area_m2 = 3, model_area_m2 = 4)
+
+sd_long_df <- monthly_compare_df %>% 
+  dplyr::select(-mean_area_m2, -median_area_m2) %>%
+  tidyr::pivot_wider(names_from = areatype, values_from = sd_area_m2) %>%
+  dplyr::rename(field_sd = 3, model_sd = 4)
+
+monthly_long_df <- areas_long_df %>% dplyr::left_join(sd_long_df)
+```
+
+Calculate residuals
+
+```{r}
+resid_data <- monthly_long_df %>%
+  dplyr::mutate(resid = model_area_m2 - field_area_m2) %>%
+  dplyr::group_by(yrmonth) %>% 
+  summarise(resid_avg = mean(resid, na.rm =TRUE), 
+            sd_resid = sd(resid, na.rm = TRUE)) %>%
+  dplyr::mutate(se_resid = sd_resid/sqrt(6))
+```

@@ -1,0 +1,198 @@
+---
+title: "04-make-inundation-ts"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(glue)
+library(readr)
+library(lubridate)
+library(zoo)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+Once classifications are extracted, daily time series can be developed from the combinations of water-classified pixel sums and imagery dates, using a moving average smoother. 
+
+```{r}
+data_dir <- "/nfs/khondula-data/planetmethane/"
+models_id_dir <- "h2o-v10-rf"
+mvdeps_class_dir <- glue("{data_dir}/stars/{models_id_dir}/05-mvdeps-classified/")
+mvdeps_class_files <- list.files(mvdeps_class_dir, full.names = TRUE)
+# mvdeps_class_file <- mvdeps_class_files[11]
+```
+
+Save summary of rf predictions for each image
+
+Summarize data for making inundation time series and plotting
+Combine files from all images into one data frame
+
+```{r}
+mvdeps_df_dir <- glue("{data_dir}/stars/{models_id_dir}/06-mvdeps-predicts")
+mvdeps_dfs_files <- list.files(mvdeps_df_dir, full.names = TRUE)
+mvdeps_files_ids <- basename(mvdeps_dfs_files) %>% tools::file_path_sans_ext()
+mvdeps_dfs <- mvdeps_dfs_files %>%
+  purrr::map_df(~read_csv(.x, col_types = c("cddddcD")))
+```
+
+
+Curate observations to based on ncells (max per ID_sp) then do rolling mean
+
+```{r}
+# remove predicts where not all cells are in image
+ncells_prop_thresh <- 0.90
+
+mvdeps_dfs <- mvdeps_dfs %>% 
+  dplyr::group_by(ID_sp) %>% 
+  mutate(max_n = max(n_cells)) %>% # max pixels for polygon
+  mutate(all_pixels = n_cells == max_n) %>% # check for all pixels
+  mutate(ncells_prop = n_cells/max_n) %>%
+  mutate(ncells_enough = ncells_prop > ncells_prop_thresh)
+
+# split into a list
+rf_predicts_list_forTS <- mvdeps_dfs %>% split(mvdeps_dfs$ID_sp)
+
+ma_window_max <- rf_predicts_list_forTS %>%
+  purrr::map(~arrange(.x, img_id)) %>%
+  purrr::map(~mutate(.x, img_datetime = as.POSIXct(substr(img_id, 1, 15), format = "%Y%m%d_%H%M%S"))) %>% 
+  purrr::map(~mutate(.x, prior_img_difftime = lag(img_datetime, 1))) %>%
+  purrr::map(~mutate(.x, img_interval = difftime(img_datetime, prior_img_difftime, units = "days"))) %>%
+  purrr::map(~mutate(.x, img_interval_days = round(as.numeric(img_interval)))) 
+
+ma_window_max_df <- ma_window_max %>% 
+  purrr::map_df(~summarise(.x, max_interval = 1+ max(img_interval_days, na.rm = TRUE)), .id = "dep_id") %>%
+  arrange(-max_interval)
+
+ma_window_max_df %>% head()
+ma_window_max_df$max_interval %>% summary()
+ma_window_max_df$max_interval %>% hist()
+
+avg_window_max_df <- ma_window_max %>% 
+  purrr::map_df(~summarise(.x, avg_interval = mean(img_interval_days, na.rm = TRUE),
+                           median_interval = median(img_interval_days, na.rm = TRUE)), 
+                .id = "dep_id") %>%
+  arrange(-avg_interval)
+
+avg_window_max_df %>% head()
+avg_window_max_df$avg_interval %>% summary()
+avg_window_max_df$avg_interval %>% hist()
+avg_window_max_df$median_interval %>% summary()
+avg_window_max_df$median_interval %>% hist()
+
+ma_window_max_df <- ma_window_max %>% 
+  purrr::map_df(~summarise(.x, max_interval = 1+ max(img_interval_days, na.rm = TRUE)), .id = "dep_id") %>%
+  arrange(-max_interval)
+
+```
+
+```{r}
+days_for_window <- 50
+n_deps_excluded <- dplyr::filter(ma_window_max_df, max_interval > days_for_window) %>% nrow()
+percent_deps_excluded <- n_deps_excluded/nrow(ma_window_max_df)
+message(glue("{n_deps_excluded} depressions excluded, {round(percent_deps_excluded*100,2)}%"))
+
+deps_x_window <- c()
+deps_x_window <- dplyr::filter(ma_window_max_df,
+        max_interval > days_for_window) %>% pull(dep_id)
+study_days_buff_df <- data.frame(
+  img_date = seq.Date(from = as.Date("2017-09-01"), 
+  to = as.Date("2018-10-31"), by = 1))
+```
+
+```{r}
+mvdeps_dfs_sub <- mvdeps_dfs %>% dplyr::filter(!ID_sp %in% deps_x_window)
+mvdeps_dfs_sub$ID_sp %>% unique() %>% length()
+rf_predicts_list_forTS <- mvdeps_dfs_sub %>% split(mvdeps_dfs_sub$ID_sp)
+
+# Smoothing time series with a running median
+# Average days with multiple observations, 
+# # this does joins to prep for moving avg calculation
+rf_predicts_list_forzoo <- rf_predicts_list_forTS %>%
+  purrr::map(~group_by(.x, img_date, ID_sp)) %>%
+  purrr::map(~summarise(.x, water_m2_avg = mean(water_m2, na.rm = TRUE))) %>%
+  purrr::map(~right_join(.x, study_days_buff_df, by = "img_date")) %>%
+  purrr::map(~ungroup(.x))
+
+# names(rf_predicts_list_forzoo) 
+# this takes a long time!!
+rf_predicts_list_mov_avg <- names(rf_predicts_list_forzoo) %>%
+  purrr::map(~mutate(rf_predicts_list_forzoo[[.x]],
+                     water_ma = zoo::rollapply(water_m2_avg,
+                                               partial = TRUE,
+                                               width = days_for_window,
+                                               FUN = median,
+#                                                # fill = NA,
+                                               na.rm = TRUE)))
+#rename
+names(rf_predicts_list_mov_avg) <- glue("dep_{names(rf_predicts_list_forzoo)}")
+
+
+mov_avg_ts <- rf_predicts_list_mov_avg %>%
+  dplyr::bind_rows(.id = "dep_id_chr") %>% 
+  dplyr::mutate(dep_id = substr(dep_id_chr, 5, 10))
+```
+
+
+
+
+```{r}
+wateryear_days <- seq.Date(from = as.Date("2017-10-01"), 
+                             to = as.Date("2018-09-30"), by = 1)
+
+mov_avg_ts_WY <- mov_avg_ts %>% 
+  dplyr::filter(img_date %in% wateryear_days)
+
+mvdeps_meta_filename <- glue("{data_dir}/stars/ref/mvdeps_meta_df.csv")
+mvdeps_meta_df <- readr::read_csv(mvdeps_meta_filename)
+mvdeps_nlcd <- readr::read_csv(glue("{data_dir}/stars/ref/mvdeps_meta.csv"))
+my_nlcd_classes <- c(90, 41, 42, 43)
+my_nlcd_classes <- c(90)
+mvdeps_mynlcd <- dplyr::filter(mvdeps_nlcd, top_class %in% my_nlcd_classes)
+# mvdeps_mynlcd %>% length()
+mvdeps_mynlcd %>% nrow()
+# mvdeps_mynlcd %>% nrow()/(11189-104)
+# mov_avg_ts_WY$dep_id_chr %>% unique() %>% length()
+mov_avg_ts_WY %>%
+  group_by(img_date) %>% # per date 
+  summarise(water_m2 = sum(water_ma, na.rm = TRUE), 
+            water_km2 = water_m2/1e6) %>%
+  # summarize time series stats for all greensboro
+  summarise(max_water_km2 = max(water_km2),
+            min_water_km2 = min(water_km2),
+            median_water_km2 = median(water_km2),
+            cv_water = sd(water_km2)/mean(water_km2)*(100),
+            mean_water_km2 = mean(water_km2))
+
+daily_ts_WY <- mov_avg_ts_WY %>%
+  group_by(img_date) %>% # per date 
+  summarise(water_m2 = sum(water_ma, na.rm = TRUE), 
+            water_km2 = water_m2/1e6)
+
+mov_avg_sum_stats <- mov_avg_ts_WY %>%
+  # first sum water across all deps OF INTEREST 
+  dplyr::filter(dep_id %in% mvdeps_mynlcd$dep_id) %>%
+  group_by(img_date) %>% # per date 
+  summarise(water_m2 = sum(water_ma, na.rm = TRUE), 
+            water_km2 = water_m2/1e6) %>%
+  # then summarize time series stats
+  summarise(max_water_km2 = max(water_km2),
+            min_water_km2 = min(water_km2),
+            median_water_km2 = median(water_km2),
+            cv_water = sd(water_km2)/mean(water_km2)*(100),
+            mean_water_km2 = mean(water_km2))
+
+mov_avg_sum <- mov_avg_ts_WY %>%
+  dplyr::left_join(mvdeps_nlcd, by = c("dep_id" = "dep_id")) %>%
+  # dplyr::filter(dep_id %in% mvdeps_mynlcd$dep_id) %>%
+  group_by(img_date, class_name) %>%
+  summarise(water_m2 = sum(water_ma, na.rm = TRUE), # NA rm 
+            water_km2 = water_m2/1e6)
+```
+

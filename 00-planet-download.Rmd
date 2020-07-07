@@ -1,0 +1,83 @@
+---
+title: "Download Planet Imagery"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(httr)
+library(jsonlite)
+library(glue)
+library(magrittr)
+```
+
+```{r}
+data_dir <- "/nfs/khondula-data/planetmethane/"
+```
+
+API key and endpoints
+
+```{r}
+api_key <- scan("planet-api-key", "")
+planet_api_URL <- "https://api.planet.com/data/v1/"
+planet_stats_api <- 'https://api.planet.com/data/v1/stats'
+planet_quicksearch_api <- 'https://api.planet.com/data/v1/quick-search'
+itemtype <- "analytic_sr"
+# itemtype <- "visual"
+# itemtype <- "udm"
+# itemtype <- "analytic_xml"
+
+source('R/request_img_url.R') # functions for activating assets
+source('R/request_udm_url.R')
+source('R/request_xml_url.R')
+```
+
+```{r}
+# create list of new images to get
+
+library(dplyr)
+inventory_file <- 'data/PlanetScope-images-inventory - Images.csv'
+imgs_to_get_df <- readr::read_csv(inventory_file) %>%
+  dplyr::select(image_ID, have, get, priority, Greensboro, notes, clouds) %>%
+  dplyr::filter(Greensboro) %>% 
+  mutate(get = stringr::str_to_upper(get)) %>%
+  dplyr::filter(get == "GET")
+
+imgs_to_get <- imgs_to_get_df %>% 
+  dplyr::filter(priority == "regular") %>% 
+  pull(image_ID)
+
+# UDMs
+
+udm_dir <- glue::glue("{data_dir}/metadata/download_udm")
+my_udms <- basename(list.files(udm_dir))
+my_udms_ids <- gsub("_udm.tiff", "", my_udms)
+
+udms_to_get <- all_img_ids[!all_img_ids %in% my_udms_ids]
+
+# XMLs
+
+xml_dir <- glue::glue("{data_dir}/metadata/download_xml")
+my_xlms <- basename(list.files(xml_dir))
+my_xlms_ids <- gsub("_analytic_xml.xml", "", my_xlms)
+
+xmls_to_get <- all_img_ids[!all_img_ids %in% my_xlms_ids]
+```
+
+Download a specific asset based on item ID
+
+```{r}
+
+purrr::walk(imgs_to_get, ~request_img_url(.x))
+purrr::walk(imgs_to_get, ~request_img_url2(.x))
+
+purrr::walk(udms_to_get, ~request_udm_url(.x))
+purrr::walk(udms_to_get, ~request_udm_url2(.x))
+
+purrr::walk(xmls_to_get, ~request_xml_url(.x))
+purrr::walk(xmls_to_get, ~request_xml_url2(.x))
+```
+
+

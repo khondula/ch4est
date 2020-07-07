@@ -1,0 +1,198 @@
+---
+title: "Image Preprocessing"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(raster)
+library(readr)
+library(fs)
+library(stringr)
+library(dplyr)
+library(colorspace)
+library(sf)
+library(binaryLogic)
+library(sp)
+library(velox)
+library(readr)
+library(glue)
+library(dplyr)
+```
+
+# Apply UDM
+
+* The Unusable data mask from Planet described [here](https://github.com/planetlabs/notebooks/blob/master/jupyter-notebooks/udm/udm.ipynb)
+* Most conservative - only keep pixels where the value of the UDM is 0, i.e. there are no flags. 
+* UDMs are saved in `metadata/download_udm/
+
+
+```{r}
+data_dir <- "/nfs/khondula-data/planetmethane"
+analytic_sr_dir <- glue("{data_dir}/download_analytic_sr")
+myimg_files_nfs <- basename(list.files(analytic_sr_dir))
+myimg_ids <- gsub("_analytic_sr.tiff", "", myimg_files_nfs)
+udm_dir <- glue("{data_dir}/metadata/download_udm")
+all_udms <- basename(list.files(udm_dir))
+myudms_ids <- gsub("_udm.tiff", "", all_udms)
+
+message(glue("You have {length(myimg_ids)} images"))
+message(glue("You have {length(myudms_ids)} UDMs"))
+# myimg_ids[which(!myimg_ids %in% myudms_ids)]
+```
+
+Mask the image to set all values as NA that are not 0 in the unusable data mask
+
+First make a vector of the images that are in data/ but not in udm_masked_imgs
+
+```{r ids_to_mask}
+masked_imgs_dir <- glue("{data_dir}/udm_masked_imgs")
+masked_imgs <- list.files(masked_imgs_dir, pattern = ".grd")
+masked_imgs_ids <- tools::file_path_sans_ext(masked_imgs)
+message(glue("{length(masked_imgs_ids)} udm masked images"))
+
+imgIDs_to_mask <- myimg_ids[!myimg_ids %in% masked_imgs_ids]
+message(glue("{length(imgIDs_to_mask)} udm masked images"))
+message("Not masked: ", paste(imgIDs_to_mask, collapse = ", "))
+
+imgIDs_to_mask_w_udms <- imgIDs_to_mask[imgIDs_to_mask %in% myudms_ids]
+imgIDs_to_mask_w_udms
+```
+
+Apply UDM mask to vector you just created - IDs with UDMs that arent in udm_masked_imgs folder:
+
+```{r udm_func_defn}
+# imgID <- imgIDs_to_mask_w_udms[1]
+
+apply_udm_mask <- function(imgID){
+  
+  data_dir <- "/nfs/khondula-data/planetmethane"
+  analytic_sr_dir <- glue("{data_dir}/download_analytic_sr")
+  myimg_files_nfs <- list.files(analytic_sr_dir, full.names = TRUE)
+  myimg_file <- grep(imgID, myimg_files_nfs, value = TRUE)
+  myimg <- raster::stack(myimg_file)
+
+  udm_dir <- glue("{data_dir}/metadata/download_udm")
+  all_udms <- list.files(udm_dir, full.names = TRUE)
+  myudms_ids <- gsub("_udm.tiff", "", all_udms)
+  myudm_file <- grep(imgID, all_udms, value = TRUE)
+  myimg_udm <- raster(myudm_file)
+
+  masked_filename = glue("/nfs/khondula-data/planetmethane/udm_masked_imgs/{imgID}.grd")
+  masked_stack <- mask(myimg, 
+                       myimg_udm, 
+                       inverse = TRUE, 
+                       maskvalue = 0, 
+                       updatevalue = NA,
+                     filename = masked_filename, 
+                     overwrite = TRUE)  
+}
+
+```
+
+Run function locally 
+
+```{r}
+# apply_udm_mask(imgID = imgIDs_to_mask_w_udms[1])
+# purrr::walk(imgIDs_to_mask_w_udms[], ~apply_udm_mask(.x))
+```
+
+# Add Bands
+
+First figure out which images will be used for analysis and need the additional bands added
+
+```{r}
+masked_imgfiles <- fs::dir_ls(glue("{data_dir}/udm_masked_imgs/"), glob = "*.grd")
+masked_ids <- gsub(".grd", "", basename(masked_imgfiles))
+message(paste(length(masked_ids), "udm masked images"))
+
+addbands_files <- fs::dir_ls(glue("{data_dir}/imgs_for_analysis"))
+addbands_ids <- gsub(".tif", "", basename(addbands_files))
+message(paste(length(addbands_ids), "images for analysis with bands added"))
+
+# 
+needbands_files <- masked_imgfiles[!masked_ids %in% addbands_ids]
+
+message(paste(length(needbands_files), "udm masked images without bands added"))
+
+```
+
+
+```{r addbands_func_defn}
+masked_imgfile <- needbands_files[1]
+# masked_imgfile <- masked_imgfiles[1]
+
+save_allbands <- function(masked_imgfile){
+  # read in original 4 bands
+    data_dir <- "/nfs/khondula-data/planetmethane"
+  r_stack <- raster::stack(masked_imgfile)
+  # get imgID
+  imgID <- basename(masked_imgfile) %>% gsub(".grd", "", .)
+    
+  new_filename <- glue("{data_dir}/imgs_for_analysis/{imgID}.tiff")
+  # add NDVI layer
+  r_stack$NDVI <- raster::overlay(r_stack[[3]], r_stack[[4]],
+                                   fun = function(b3, b4){return((b4-b3)/(b4+b3))})
+                                   # filename = new_filename)
+  # add NDWI layer
+  r_stack$NDWI <- raster::overlay(r_stack[[2]], r_stack[[4]],
+                                   fun = function(b2, b4){return((b2-b4)/(b2+b4))})
+                                   # filename = new_filename)
+  # get vectors of band values
+  b1_blue <- velox::velox(r_stack)$as.matrix(band = 1) %>% as.vector()
+  b2_green <- velox::velox(r_stack)$as.matrix(band = 2) %>% as.vector()
+  b3_red <- velox::velox(r_stack)$as.matrix(band = 3) %>% as.vector()
+  b4_NIR <- velox::velox(r_stack)$as.matrix(band = 4) %>% as.vector()
+  
+  # convert to data frame
+  rgbvals <- data.frame("b1_blue" = b1_blue, 
+                        "b2_green" = b2_green, 
+                        "b3_red" = b3_red) %>%
+    dplyr::mutate(cellid = 1:ncell(r_stack)) 
+  
+  rgbvals_narm <- rgbvals %>% 
+    dplyr::filter(!is.na(b1_blue), !is.na(b2_green), !is.na(b3_red))
+  # calculate hue saturation value
+  hsvvals <- rgb2hsv(r = rgbvals_narm[,"b3_red"],
+                   g = rgbvals_narm[,"b2_green"], 
+                   b = rgbvals_narm[,"b1_blue"], 
+                   maxColorValue = max(rgbvals_narm[,1:3]))
+  # calculate chroma luminance hue2
+  labvals <- colorspace::RGB(rgbvals_narm[,"b3_red"], 
+                           rgbvals_narm[,"b2_green"],
+                           rgbvals_narm[,"b1_blue"]) %>% as("polarLAB")
+  
+  # get all values together in a dataframe
+  hsv_df <- hsvvals %>% t() %>% as.data.frame() %>% 
+    dplyr::mutate(cellid = rgbvals_narm$cellid)
+
+  labvals_df <- labvals@coords %>% as.data.frame() %>% 
+    dplyr::mutate(cellid = rgbvals_narm$cellid)
+  
+  colmetrics_df <- rgbvals %>% 
+    dplyr::left_join(hsv_df) %>% 
+    dplyr::left_join(labvals_df)
+
+  # define new function to make raster layer from column
+  column_to_rasterlayer <- function(colorcol){
+    lum_mat <- matrix(colmetrics_df[[colorcol]], nrow(r_stack), ncol(r_stack))
+    lum_vx <- velox::velox(lum_mat, extent = extent(r_stack), res = res(r_stack))
+    return(lum_vx$as.RasterLayer())}
+
+  r_stack$HUE <- column_to_rasterlayer("h")
+  r_stack$SAT <- column_to_rasterlayer("s")
+  r_stack$VAL <- column_to_rasterlayer("v")
+  r_stack$LUM <- column_to_rasterlayer("L")
+  r_stack$CHROMA <- column_to_rasterlayer("C")
+  r_stack$HUE2 <- column_to_rasterlayer("H")
+
+  raster::writeRaster(r_stack, new_filename, overwrite = TRUE)    
+
+  }
+```
+
+```{r}
+# save_allbands(masked_imgfile = masked_imgfiles[3])
+# purrr::walk(needbands_files, ~save_allbands(masked_imgfile = .x))
+```
+
